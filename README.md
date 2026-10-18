@@ -1,3 +1,42 @@
+# Nexus Nono fork
+
+This is the `leiringer-ai/nono` fork used for Nexus qualification. The maintained
+branch is `nexus`, based on upstream v0.80.0
+(`8bb041356d48f771a221e58c98d9b1ff442e76fe`). Upstream history and licensing are
+preserved. Changes were implemented with OpenAI Codex assistance at the fork
+owner's request; they are not submitted to upstream.
+
+The fork implements Basic authentication for upstream proxy chaining across
+CONNECT, HTTP forwarding and TLS interception. Use
+`--upstream-proxy-credential file:///absolute/private/session.auth` with
+`--upstream-proxy 127.0.0.1:PORT`. The file contains `username:password`, must be
+owner-only, and must remain outside every sandbox filesystem grant. Nexus uses
+only a revocable session capability here; real provider credentials remain in
+the separate Nexus broker. Missing credentials or upstream denial fail closed.
+Credentials are not accepted from environment or command references.
+
+The lockfile also updates Rustls to 0.23.46 to address the audit findings in the
+upstream baseline. Build with `cargo build --locked -p nono-cli`; validate with
+`PATH=/home/user/.cargo/bin:/usr/bin:/bin RUST_TEST_THREADS=1 make ci` (substitute
+the local Cargo path). Serial tests avoid upstream process-environment races.
+Linux qualification uses fabricated provider credentials:
+
+```sh
+/usr/bin/python3 scripts/test-nexus-upstream-auth.py   --nexus /path/to/nexus --nono target/debug/nono --output /tmp/containment.json
+```
+
+macOS and live-provider qualification are separate gates. Do not treat a
+successful fixture run as production acceptance.
+
+For future maintenance, fetch `nolabs-ai/nono` through an `upstream` remote,
+review changes on a candidate branch, preserve or retire each local patch
+explicitly, and rerun CI and Nexus containment checks before advancing `nexus`.
+Consumers should select an immutable fork commit and verified binary digest.
+Renkei is a candidate to perform that maintenance; no automatic update, merge,
+deployment, or upstream submission is configured by this fork.
+
+---
+
 <div align="center">
 
 <img src="assets/logo.gif" alt="nono logo" width="600"/>

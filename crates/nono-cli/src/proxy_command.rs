@@ -245,6 +245,12 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
         .clone()
         .or_else(|| network.and_then(|n| n.upstream_proxy.clone()));
 
+    if args.upstream_proxy_credential.is_some() && upstream_proxy_addr.is_none() {
+        return Err(NonoError::ConfigParse(
+            "--upstream-proxy-credential requires an upstream proxy".into(),
+        ));
+    }
+
     let mut upstream_bypass: Vec<String> = network
         .map(|n| n.upstream_bypass.clone())
         .unwrap_or_default();
@@ -313,6 +319,7 @@ fn build_launch_options(args: &ProxyArgs) -> Result<ProxyLaunchOptions> {
     };
 
     let upstream_proxy = upstream_proxy_addr.map(|address| UpstreamProxyIntent {
+        credential: args.upstream_proxy_credential.clone(),
         address,
         bypass: upstream_bypass,
     });

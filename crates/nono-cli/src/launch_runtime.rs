@@ -108,6 +108,7 @@ pub(crate) struct CredentialProxyIntent {
 #[derive(Clone, Debug)]
 pub(crate) struct UpstreamProxyIntent {
     pub(crate) address: String,
+    pub(crate) credential: Option<String>,
     pub(crate) bypass: Vec<String>,
 }
 

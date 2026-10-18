@@ -8,15 +8,55 @@
 //! [`connect_via_proxy`] so the TLS-intercept upstream leg can reuse it.
 
 use crate::audit;
-use crate::config::ExternalProxyConfig;
+use crate::config::{ExternalProxyAuth, ExternalProxyConfig};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
 use crate::line_reader;
 use crate::token;
+use base64::Engine;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::debug;
 use zeroize::Zeroizing;
+
+/// Resolve Basic authentication before accepting requests; never use child headers.
+pub(crate) fn load_proxy_auth(
+    auth: Option<&ExternalProxyAuth>,
+    outer_caps: Option<&nono::CapabilitySet>,
+) -> Result<Option<Zeroizing<String>>> {
+    let Some(auth) = auth else {
+        return Ok(None);
+    };
+    if auth.scheme != "basic" {
+        return Err(ProxyError::ExternalProxy(
+            "unsupported upstream proxy authentication scheme".into(),
+        ));
+    }
+    if auth.keyring_account.starts_with("env://") || auth.keyring_account.starts_with("cmd://") {
+        return Err(ProxyError::ExternalProxy(
+            "upstream proxy authentication requires a keystore or file credential reference".into(),
+        ));
+    }
+    let secret = nono::keystore::load_secret_by_ref(
+        nono::keystore::DEFAULT_SERVICE,
+        &auth.keyring_account,
+        outer_caps,
+    )
+    .map_err(|_| ProxyError::ExternalProxy("upstream proxy credential unavailable".into()))?;
+    basic_proxy_auth(&secret).map(Some)
+}
+
+fn basic_proxy_auth(secret: &str) -> Result<Zeroizing<String>> {
+    if secret.len() > 8192 || !secret.contains(':') || secret.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err(ProxyError::ExternalProxy(
+            "upstream proxy credential must be username:password without control characters".into(),
+        ));
+    }
+    let mut header = Zeroizing::new(String::from("Basic "));
+    base64::engine::general_purpose::STANDARD.encode_string(secret.as_bytes(), &mut header);
+    Ok(header)
+}
 
 /// TCP-connect to an enterprise proxy and CONNECT through it to `target_host:target_port`.
 ///
@@ -44,12 +84,19 @@ pub async fn connect_via_proxy(
         ))
     })?;
 
-    let mut connect_req = format!(
+    let mut connect_req = Zeroizing::new(format!(
         "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n",
         target_host, target_port, target_host, target_port
-    );
+    ));
     if let Some(auth) = proxy_auth_header {
-        connect_req.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+        if auth.bytes().any(|b| b.is_ascii_control()) {
+            return Err(ProxyError::ExternalProxy(
+                "invalid upstream proxy authorization header".into(),
+            ));
+        }
+        connect_req.push_str("Proxy-Authorization: ");
+        connect_req.push_str(auth);
+        connect_req.push_str("\r\n");
     }
     connect_req.push_str("\r\n");
 
@@ -61,7 +108,7 @@ pub async fn connect_via_proxy(
         })?;
 
     let mut buf_reader = BufReader::new(&mut proxy_stream);
-    let mut response_line = String::new();
+    let mut response_line = Zeroizing::new(String::new());
     line_reader::read_line_limited_string(
         &mut buf_reader,
         &mut response_line,
@@ -85,7 +132,7 @@ pub async fn connect_via_proxy(
 
     // Drain headers up to the empty line.
     loop {
-        let mut line = String::new();
+        let mut line = Zeroizing::new(String::new());
         line_reader::read_line_limited_string(
             &mut buf_reader,
             &mut line,
@@ -190,6 +237,7 @@ pub async fn handle_external_proxy(
     session_token: &Zeroizing<String>,
     require_auth: bool,
     external_config: &ExternalProxyConfig,
+    upstream_auth: Option<&str>,
     audit_log: Option<&audit::SharedAuditLog>,
 ) -> Result<()> {
     // Parse CONNECT target
@@ -221,66 +269,60 @@ pub async fn handle_external_proxy(
         return Err(ProxyError::HostDenied { host, reason });
     }
 
-    // External proxy authentication is not yet implemented. If auth is
-    // configured, fail loudly rather than silently sending unauthenticated
-    // requests that the enterprise proxy will reject.
-    if external_config.auth.is_some() {
+    if external_config.auth.is_some() && upstream_auth.is_none() {
         return Err(ProxyError::ExternalProxy(
-            "external proxy authentication is configured but not yet implemented; \
-             remove the auth section from the external proxy config or wait for \
-             a future release"
-                .to_string(),
+            "upstream proxy credential unavailable".into(),
         ));
     }
-
-    // Connect to enterprise proxy and CONNECT through it to the upstream.
-    // Auth is gated above; pass None until configurable proxy auth lands.
-    let mut proxy_stream = match connect_via_proxy(&external_config.address, &host, port, None)
-        .await
-    {
-        Ok(s) => s,
-        Err(ProxyError::ExternalProxy(msg)) if msg.contains("rejected CONNECT") => {
-            // Enterprise proxy returned non-200. Surface the same status
-            // back to the agent so it can react sensibly (e.g. blocked
-            // by corporate policy).
-            audit::log_denied(
-                audit_log,
-                audit::ProxyMode::External,
-                &audit::EventContext {
-                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
-                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
-                    denial_category: Some(
-                        nono::undo::NetworkAuditDenialCategory::ExternalProxyRejected,
-                    ),
-                    ..audit::EventContext::default()
-                },
-                &host,
-                port,
-                &msg,
-            );
-            send_response(stream, 502, "Bad Gateway").await?;
-            return Err(ProxyError::ExternalProxy(msg));
-        }
-        Err(e) => {
-            audit::log_denied(
-                audit_log,
-                audit::ProxyMode::External,
-                &audit::EventContext {
-                    auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
-                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
-                    denial_category: Some(
-                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
-                    ),
-                    ..audit::EventContext::default()
-                },
-                &host,
-                port,
-                &e.to_string(),
-            );
-            send_response(stream, 502, "Bad Gateway").await?;
-            return Err(e);
-        }
-    };
+    let mut proxy_stream =
+        match connect_via_proxy(&external_config.address, &host, port, upstream_auth).await {
+            Ok(s) => s,
+            Err(ProxyError::ExternalProxy(msg)) if msg.contains("rejected CONNECT") => {
+                // Enterprise proxy returned non-200. Surface the same status
+                // back to the agent so it can react sensibly (e.g. blocked
+                // by corporate policy).
+                audit::log_denied(
+                    audit_log,
+                    audit::ProxyMode::External,
+                    &audit::EventContext {
+                        auth_mechanism: Some(
+                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                        ),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::ExternalProxyRejected,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    &msg,
+                );
+                send_response(stream, 502, "Bad Gateway").await?;
+                return Err(ProxyError::ExternalProxy(msg));
+            }
+            Err(e) => {
+                audit::log_denied(
+                    audit_log,
+                    audit::ProxyMode::External,
+                    &audit::EventContext {
+                        auth_mechanism: Some(
+                            nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization,
+                        ),
+                        auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Succeeded),
+                        denial_category: Some(
+                            nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                        ),
+                        ..audit::EventContext::default()
+                    },
+                    &host,
+                    port,
+                    &e.to_string(),
+                );
+                send_response(stream, 502, "Bad Gateway").await?;
+                return Err(e);
+            }
+        };
 
     // Send 200 to agent
     send_response(stream, 200, "Connection Established").await?;
@@ -345,14 +387,13 @@ fn enforce_proxy_auth(
 fn parse_status_code(line: &str) -> Result<u16> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(ProxyError::HttpParse(format!(
-            "malformed HTTP response: {}",
-            line
-        )));
+        return Err(ProxyError::HttpParse(
+            "malformed upstream proxy HTTP response".into(),
+        ));
     }
     parts[1]
         .parse::<u16>()
-        .map_err(|_| ProxyError::HttpParse(format!("invalid status code in response: {}", line)))
+        .map_err(|_| ProxyError::HttpParse("invalid upstream proxy status code".into()))
 }
 
 /// Send an HTTP response line.
@@ -367,6 +408,66 @@ async fn send_response(stream: &mut TcpStream, status: u16, reason: &str) -> Res
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_auth_encoding_and_fail_closed_validation() {
+        assert_eq!(
+            &**basic_proxy_auth("user:password:with:colon").unwrap(),
+            "Basic dXNlcjpwYXNzd29yZDp3aXRoOmNvbG9u"
+        );
+        for value in [
+            "missing-separator",
+            "user:secret\r\nInjected: value",
+            "user:secret\0",
+        ] {
+            let error = basic_proxy_auth(value).unwrap_err().to_string();
+            assert!(!error.contains(value));
+        }
+        assert!(
+            load_proxy_auth(
+                Some(&ExternalProxyAuth {
+                    keyring_account: "env://DO_NOT_READ".into(),
+                    scheme: "basic".into()
+                }),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            load_proxy_auth(
+                Some(&ExternalProxyAuth {
+                    keyring_account: "unused".into(),
+                    scheme: "unknown".into()
+                }),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            !parse_status_code("HTTP/1.1 reflected-secret")
+                .unwrap_err()
+                .to_string()
+                .contains("reflected-secret")
+        );
+    }
+
+    #[test]
+    fn upstream_auth_file_is_loaded_and_missing_source_is_not_anonymous() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("credential");
+        std::fs::write(&file, "user:fixture-password").unwrap();
+        let auth = ExternalProxyAuth {
+            keyring_account: format!("file://{}", file.display()),
+            scheme: "basic".into(),
+        };
+        assert_eq!(
+            &**load_proxy_auth(Some(&auth), None).unwrap().unwrap(),
+            "Basic dXNlcjpmaXh0dXJlLXBhc3N3b3Jk"
+        );
+        std::fs::remove_file(file).unwrap();
+        assert!(load_proxy_auth(Some(&auth), None).is_err());
+        assert!(load_proxy_auth(None, None).unwrap().is_none());
+    }
 
     #[test]
     fn test_parse_connect_target() {

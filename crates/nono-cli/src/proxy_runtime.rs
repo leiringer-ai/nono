@@ -1473,6 +1473,12 @@ pub(crate) fn prepare_proxy_launch_options(
             .or_else(|| prepared.upstream_proxy.clone())
     };
 
+    if args.upstream_proxy_credential.is_some() && upstream_proxy_addr.is_none() {
+        return Err(NonoError::ConfigParse(
+            "--upstream-proxy-credential requires an active upstream proxy".into(),
+        ));
+    }
+
     let upstream_bypass = if args.allow_net {
         Vec::new()
     } else if args.external_proxy.is_some() {
@@ -1556,6 +1562,7 @@ pub(crate) fn prepare_proxy_launch_options(
         };
 
     let upstream_proxy = upstream_proxy_addr.map(|address| UpstreamProxyIntent {
+        credential: args.upstream_proxy_credential.clone(),
         address,
         bypass: upstream_bypass,
     });
@@ -2505,7 +2512,12 @@ pub(crate) fn build_proxy_config_from_flags(
     if let Some(ref upstream) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
             address: upstream.address.clone(),
-            auth: None,
+            auth: upstream.credential.as_ref().map(|credential| {
+                nono_proxy::config::ExternalProxyAuth {
+                    keyring_account: credential.clone(),
+                    scheme: "basic".into(),
+                }
+            }),
             bypass_hosts: upstream.bypass.clone(),
         });
     }

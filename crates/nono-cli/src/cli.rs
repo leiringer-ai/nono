@@ -1226,6 +1226,15 @@ pub struct SandboxArgs {
     )]
     pub external_proxy: Option<String>,
 
+    /// Credential reference containing username:password for the upstream proxy.
+    /// Use a keystore reference or file:// URI, never a literal password.
+    #[arg(
+        long = "upstream-proxy-credential",
+        value_name = "REF",
+        help_heading = "NETWORK"
+    )]
+    pub upstream_proxy_credential: Option<String>,
+
     /// Route these domains direct instead of through the upstream proxy
     #[arg(
         long = "upstream-bypass",
@@ -1426,6 +1435,7 @@ impl SandboxArgs {
             || !self.allow_proxy.is_empty()
             || !self.proxy_credential.is_empty()
             || self.external_proxy.is_some()
+            || self.upstream_proxy_credential.is_some()
     }
 }
 
@@ -1537,6 +1547,15 @@ pub struct ProxyArgs {
         help_heading = "NETWORK"
     )]
     pub external_proxy: Option<String>,
+
+    /// Credential reference containing username:password for the upstream proxy.
+    /// Use a keystore reference or file:// URI, never a literal password.
+    #[arg(
+        long = "upstream-proxy-credential",
+        value_name = "REF",
+        help_heading = "NETWORK"
+    )]
+    pub upstream_proxy_credential: Option<String>,
 
     /// Route these domains direct instead of through the upstream proxy
     #[arg(
@@ -1871,6 +1890,7 @@ impl From<WrapSandboxArgs> for SandboxArgs {
             allow_port: args.allow_port,
             allow_connect_port: args.allow_connect_port,
             external_proxy: None,
+            upstream_proxy_credential: None,
             external_proxy_bypass: Vec::new(),
             proxy_port: None,
             #[cfg(target_os = "macos")]

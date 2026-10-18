@@ -1523,7 +1523,8 @@ pub struct ExternalProxyConfig {
 /// Authentication for an external proxy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalProxyAuth {
-    /// Keystore account name for proxy credentials.
+    /// Credential reference containing UTF-8 `username:password`.
+    /// Uses the same keystore/file reference resolver as route credentials.
     pub keyring_account: String,
 
     /// Authentication scheme (only "basic" supported).

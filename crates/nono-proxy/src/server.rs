@@ -909,6 +909,7 @@ struct ProxyState {
     /// Keeping this separate prevents a credential route from widening CONNECT.
     route_filter: ProxyFilter,
     session_token: Zeroizing<String>,
+    upstream_proxy_auth: Option<Zeroizing<String>>,
     /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
     route_store: Arc<RouteStore>,
     /// Credential-specific configuration (inject mode, headers, secrets) for routes with credentials.
@@ -1152,6 +1153,14 @@ pub async fn start_with_nonce_resolver(
     tls_config_h2.alpn_protocols = vec![b"h2".to_vec()];
     let tls_connector_h2 = tokio_rustls::TlsConnector::from(Arc::new(tls_config_h2));
 
+    let upstream_proxy_auth = external::load_proxy_auth(
+        config
+            .external_proxy
+            .as_ref()
+            .and_then(|proxy| proxy.auth.as_ref()),
+        config.outer_caps.as_ref(),
+    )?;
+
     // Load credentials for reverse proxy routes (static keystore + OAuth2)
     let (credential_store, proxy_diagnostics) = if config.routes.is_empty() {
         (CredentialStore::empty(), Vec::new())
@@ -1346,6 +1355,7 @@ pub async fn start_with_nonce_resolver(
         session_token: session_token.clone(),
         route_store: Arc::new(route_store),
         credential_store: Arc::new(credential_store),
+        upstream_proxy_auth,
         oauth_capture_store,
         config,
         tls_connector,
@@ -1692,34 +1702,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                                 if bypassed {
                                     debug!("tls_intercept: bypassing upstream proxy for {}", host);
                                     None
-                                } else if ext_config.auth.is_some() {
-                                    // Auth is configured but not yet implemented.
-                                    // Fail loudly rather than silently connecting
-                                    // without auth — the corporate proxy would
-                                    // reject anyway.
-                                    let msg = "external proxy authentication is configured \
-                                         but not yet implemented; remove the auth \
-                                         section from the external proxy config or \
-                                         wait for a future release";
-                                    audit::log_denied(
-                                        state.audit_log.as_ref(),
-                                        audit::ProxyMode::ConnectIntercept,
-                                        &audit::EventContext {
-                                            route_id,
-                                            ..audit::EventContext::default()
-                                        },
-                                        &host,
-                                        port,
-                                        msg,
-                                    );
-                                    let response =
-                                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-                                    stream.write_all(response.as_bytes()).await?;
-                                    return Err(ProxyError::ExternalProxy(msg.to_string()));
                                 } else {
                                     Some(tls_intercept::InterceptUpstreamProxy {
                                         proxy_addr: &ext_config.address,
-                                        proxy_auth_header: None,
+                                        proxy_auth_header: state
+                                            .upstream_proxy_auth
+                                            .as_deref()
+                                            .map(String::as_str),
                                     })
                                 }
                             } else {
@@ -1859,6 +1848,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 &state.session_token,
                 state.config.require_auth,
                 ext_config,
+                state.upstream_proxy_auth.as_deref().map(String::as_str),
                 state.audit_log.as_ref(),
             )
             .await
@@ -2148,40 +2138,14 @@ async fn handle_forward_http(
     //    proxy when configured (unless the host is a bypass host), else
     //    connect directly to the resolved addresses (DNS-rebinding-safe).
     let ext_proxy_addr = match state.config.external_proxy.as_ref() {
-        Some(ext) if !(state.bypass_matcher.matches(&host)) => {
-            // Mirror the CONNECT/intercept paths: external proxy auth is
-            // configured-but-unimplemented, so fail loudly rather than
-            // silently connecting unauthenticated.
-            if ext.auth.is_some() {
-                let msg = "external proxy authentication is configured but not yet \
-                     implemented; remove the auth section from the external proxy \
-                     config or wait for a future release";
-                audit::log_denied(
-                    state.audit_log.as_ref(),
-                    audit::ProxyMode::Reverse,
-                    &audit::EventContext {
-                        denial_category: Some(
-                            nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
-                        ),
-                        ..audit::EventContext::default()
-                    },
-                    &host,
-                    port,
-                    msg,
-                );
-                let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-                stream.write_all(response.as_bytes()).await?;
-                return Err(ProxyError::ExternalProxy(msg.to_string()));
-            }
-            Some(ext.address.clone())
-        }
+        Some(ext) if !(state.bypass_matcher.matches(&host)) => Some(ext.address.clone()),
         _ => None,
     };
 
     let strategy = match ext_proxy_addr.as_deref() {
         Some(addr) => UpstreamStrategy::ExternalProxy {
             proxy_addr: addr,
-            proxy_auth_header: None,
+            proxy_auth_header: state.upstream_proxy_auth.as_deref().map(String::as_str),
         },
         None => UpstreamStrategy::Direct {
             resolved_addrs: &check.resolved_addrs,
