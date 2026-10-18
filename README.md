@@ -32,6 +32,10 @@ For future maintenance, fetch `nolabs-ai/nono` through an `upstream` remote,
 review changes on a candidate branch, preserve or retire each local patch
 explicitly, and rerun CI and Nexus containment checks before advancing `nexus`.
 Consumers should select an immutable fork commit and verified binary digest.
+GitHub Actions are disabled at the fork repository level to prevent inherited
+CI and release costs. Run validation locally; do not enable hosted jobs without
+the owner explicitly selecting their scope.
+
 Renkei is a candidate to perform that maintenance; no automatic update, merge,
 deployment, or upstream submission is configured by this fork.
 
