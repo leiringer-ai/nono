@@ -13,6 +13,13 @@ CONNECT, HTTP forwarding and TLS interception. Use
 owner-only, and must remain outside every sandbox filesystem grant. Nexus uses
 only a revocable session capability here; real provider credentials remain in
 the separate Nexus broker. Missing credentials or upstream denial fail closed.
+
+Reactive clients such as NuGet receive `407 Proxy Authentication Required` with
+a Basic challenge and an explicit connection close when their initial external
+CONNECT lacks valid session authentication. They can retry on a new socket.
+Denied authentication never contacts the upstream proxy, and an authenticated
+tunnel forwards only the supervisor's upstream credential. Cloud metadata
+destinations remain denied.
 Credentials are not accepted from environment or command references.
 
 The lockfile also updates Rustls to 0.23.46 to address the audit findings in the
