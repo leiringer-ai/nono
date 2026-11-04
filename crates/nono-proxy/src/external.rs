@@ -245,7 +245,27 @@ pub async fn handle_external_proxy(
     debug!("External proxy CONNECT to {}:{}", host, port);
 
     // Validate session token (skipped when auth is disabled)
-    enforce_proxy_auth(require_auth, remaining_header, session_token)?;
+    if let Err(error) = enforce_proxy_auth(require_auth, remaining_header, session_token) {
+        audit::log_denied(
+            audit_log,
+            audit::ProxyMode::External,
+            &audit::EventContext {
+                auth_mechanism: Some(nono::undo::NetworkAuditAuthMechanism::ProxyAuthorization),
+                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
+                denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
+                ..audit::EventContext::default()
+            },
+            &host,
+            port,
+            "proxy authentication required",
+        );
+        // Reactive clients (including NuGet) send credentials only after a
+        // challenge. Explicitly close this unauthenticated connection so they
+        // can retry on a fresh socket. Never contact the upstream before auth.
+        stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"nono\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        stream.shutdown().await?;
+        return Err(error);
+    }
 
     // Check cloud metadata deny list.
     // Cloud metadata endpoints are always blocked even through enterprise proxies.
@@ -408,6 +428,125 @@ async fn send_response(stream: &mut TcpStream, status: u16, reason: &str) -> Res
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn external_proxy_challenges_then_accepts_authenticated_retry() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ExternalProxyConfig {
+            address: upstream.local_addr().unwrap().to_string(),
+            auth: Some(ExternalProxyAuth {
+                keyring_account: "unused-fixture-reference".into(),
+                scheme: "basic".into(),
+            }),
+            bypass_hosts: vec![],
+        };
+        let session = Zeroizing::new("fixture-session".to_string());
+        let valid = format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64::engine::general_purpose::STANDARD.encode("nono:fixture-session")
+        );
+        for (target, headers, status) in [
+            ("CONNECT 1.1.1.1:443 HTTP/1.1", "", 407),
+            (
+                "CONNECT 1.1.1.1:443 HTTP/1.1",
+                "Proxy-Authorization: Basic wrong\r\n",
+                407,
+            ),
+            ("CONNECT 169.254.169.254:443 HTTP/1.1", valid.as_str(), 403),
+        ] {
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            assert!(
+                handle_external_proxy(
+                    target,
+                    &mut server,
+                    headers.as_bytes(),
+                    &ProxyFilter::allow_all(),
+                    &session,
+                    true,
+                    &config,
+                    Some("Basic supervisor-only"),
+                    None
+                )
+                .await
+                .is_err()
+            );
+            // Keep the server socket alive for 407: EOF must come from the
+            // handler's explicit close so a reactive client can retry promptly.
+            if status != 407 {
+                drop(server);
+            }
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status} ")));
+            if status == 407 {
+                assert!(response.contains("Proxy-Authenticate: Basic realm=\"nono\""));
+                assert!(response.contains("Connection: close"));
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), upstream.accept())
+                    .await
+                    .is_err(),
+                "denied request contacted upstream"
+            );
+        }
+        let proxy = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains("Proxy-Authorization: Basic supervisor-only\r\n"));
+            assert!(!request.contains("fixture-session"));
+            assert!(!request.contains(&valid));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), b'x');
+            socket.write_all(b"fixture tunnel").await.unwrap();
+        });
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+        let headers = format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64::engine::general_purpose::STANDARD.encode("nono:fixture-session")
+        );
+        handle_external_proxy(
+            "CONNECT 1.1.1.1:443 HTTP/1.1",
+            &mut server,
+            headers.as_bytes(),
+            &ProxyFilter::allow_all(),
+            &session,
+            true,
+            &config,
+            Some("Basic supervisor-only"),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(server);
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "));
+        assert!(response.ends_with("fixture tunnel"));
+        proxy.await.unwrap();
+    }
 
     #[test]
     fn upstream_auth_encoding_and_fail_closed_validation() {
